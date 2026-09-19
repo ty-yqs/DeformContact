@@ -5,7 +5,74 @@ import numpy as np
 from utils.graph_utils import *
 from pyquaternion import Quaternion
 
-def visualize_deformation_field(soft_rest_graph, soft_def_graph, rigid_graph, force_vector):
+
+# The filament offscreen renderer reliably handles only a few thousand line
+# segments; denser graph edge sets render as a black image. Subsample edges
+# beyond this count so the visualization stays intact.
+_MAX_RENDER_LINES = 5000
+
+
+def _subsample_lineset(geom, max_lines=_MAX_RENDER_LINES):
+    lines = np.asarray(geom.lines)
+    if len(lines) <= max_lines:
+        return geom
+    step = int(np.ceil(len(lines) / max_lines))
+    new_geom = o3d.geometry.LineSet()
+    new_geom.points = geom.points
+    new_geom.lines = o3d.utility.Vector2iVector(lines[::step])
+    if geom.has_colors():
+        colors = np.asarray(geom.colors)
+        new_geom.colors = o3d.utility.Vector3dVector(colors[::step])
+    return new_geom
+
+
+def _render_offscreen(geometries, save_path, width=1600, height=1200,
+                      point_size=6.0, line_width=2.0,
+                      background=(1.0, 1.0, 1.0, 1.0), side_view=False):
+    """Render a list of o3d geometries to a PNG file without needing a display."""
+    import open3d.visualization.rendering as rendering
+
+    renderer = rendering.OffscreenRenderer(width, height)
+    renderer.scene.set_background(list(background))
+
+    all_points = []
+    for i, geom in enumerate(geometries):
+        mat = rendering.MaterialRecord()
+        if isinstance(geom, o3d.geometry.LineSet):
+            geom = _subsample_lineset(geom)
+            mat.shader = "unlitLine"
+            mat.line_width = line_width
+            # The filament renderer ignores per-line colors, so use the uniform
+            # color as the material base color.
+            if geom.has_colors():
+                c = np.asarray(geom.colors)[0]
+                mat.base_color = [float(c[0]), float(c[1]), float(c[2]), 1.0]
+            else:
+                mat.base_color = [0.2, 0.2, 0.2, 1.0]
+        else:  # PointCloud
+            mat.shader = "defaultUnlit"
+            mat.point_size = point_size
+        renderer.scene.add_geometry(f"geom_{i}", geom, mat)
+        all_points.append(np.asarray(geom.points))
+
+    pts = np.concatenate(all_points, axis=0)
+    vmin, vmax = pts.min(axis=0), pts.max(axis=0)
+    center = (vmin + vmax) / 2.0
+    span = float((vmax - vmin).max())
+    if span < 1e-6:
+        span = 1.0
+    if side_view:
+        eye = center + np.array([0.0, span * 0.7, span * 2.0])
+    else:
+        eye = center + np.array([0.0, 0.0, span * 2.0])
+    renderer.scene.camera.look_at(center, eye, [0.0, 1.0, 0.0])
+
+    img = renderer.render_to_image()
+    o3d.io.write_image(save_path, img)
+    del renderer
+
+
+def visualize_deformation_field(soft_rest_graph, soft_def_graph, rigid_graph, force_vector, save_path=None):
 
     soft_rest_mesh_np = soft_rest_graph.detach().numpy()
     soft_def_mesh_np = soft_def_graph.detach().numpy()
@@ -43,10 +110,14 @@ def visualize_deformation_field(soft_rest_graph, soft_def_graph, rigid_graph, fo
     pcd_def.paint_uniform_color([0.8, 0.0, 0])
     lineset.colors = o3d.utility.Vector3dVector([[0.5, 0.5, 0.5] for _ in range(n)])
 
-    o3d.visualization.draw_geometries([pcd_rest, pcd_def, lineset, pcd_rigid, vector_lineset])
+    geometries = [pcd_rest, pcd_def, lineset, pcd_rigid, vector_lineset]
+    if save_path is not None:
+        _render_offscreen(geometries, save_path)
+    else:
+        o3d.visualization.draw_geometries(geometries)
 
 
-def visualize_merged_graphs(soft_rest_graph, soft_def_graph=None, rigid_graph=None, pred_graph=None):
+def visualize_merged_graphs(soft_rest_graph, soft_def_graph=None, rigid_graph=None, pred_graph=None, save_path=None):
     soft_rest_points_np = soft_rest_graph.pos.cpu().numpy()
     soft_rest_edge_index_np = soft_rest_graph.edge_index.t().cpu().numpy().astype(np.int32)
 
@@ -137,7 +208,10 @@ def visualize_merged_graphs(soft_rest_graph, soft_def_graph=None, rigid_graph=No
         
         geometries.extend([rigid_pcd, rigid_lines])
 
-    o3d.visualization.draw_geometries(geometries)
+    if save_path is not None:
+        _render_offscreen(geometries, save_path)
+    else:
+        o3d.visualization.draw_geometries(geometries)
 
 
 def map_deformation_to_color(deformation_values):
@@ -149,7 +223,7 @@ def map_deformation_to_color(deformation_values):
     
     return colors
 
-def visualize_deformations_normals_colors(soft_rest_graph, soft_def_graph=None):
+def visualize_deformations_normals_colors(soft_rest_graph, soft_def_graph=None, save_path=None):
     soft_rest_points_np = soft_rest_graph.pos.cpu().numpy()
     soft_rest_edge_index_np = soft_rest_graph.edge_index.t().cpu().numpy().astype(np.int32)
 
@@ -182,7 +256,10 @@ def visualize_deformations_normals_colors(soft_rest_graph, soft_def_graph=None):
 
         geometries.extend([soft_def_pcd, soft_def_lines]) 
 
-    show_from_side(geometries)
+    if save_path is not None:
+        _render_offscreen(geometries, save_path, side_view=True)
+    else:
+        show_from_side(geometries)
 
 
 

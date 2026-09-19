@@ -3,6 +3,7 @@ dataset/everyday_deform/*
 logs/*
 wandb/*
 outputs/*
+visualizations/*
 build/
 
 
