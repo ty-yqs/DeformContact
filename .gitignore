@@ -1,5 +1,6 @@
 .gitignore
 dataset/everyday_deform/*
+dataset/everyday_deform_cache/
 logs/*
 wandb/*
 outputs/*

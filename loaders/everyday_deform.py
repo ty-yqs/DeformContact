@@ -1,6 +1,7 @@
 import os
 from torch.utils.data import Dataset
 import open3d as o3d
+import numpy as np
 from utils.pointcloud_utils import construct_graph
 import torch
 import json
@@ -10,11 +11,11 @@ from loaders.common import *
 from loaders.common import _unity_to_open3d,_create_rigid_pointcloud,_feature_rigid,_load_deformed_mesh,_sample_nearest
 
 class EverydayDeformDataset(Dataset):
-    def __init__(self, root_dir, obj_list, n_points, graph_method,sphere_radius,force_max, neigbor_radius=None, neigbor_k=None, split='train'):
+    def __init__(self, root_dir, obj_list, n_points, graph_method,sphere_radius,force_max, neigbor_radius=None, neigbor_k=None, split='train', cache_dir=None):
         self.root_dir = root_dir
 
         self.samples = []
-        self.soft_rest_mesh = {}
+        self._mesh_paths = {}
         for obj in obj_list:
             obj_samples = [os.path.join(obj, f[:-4]) for f in os.listdir(os.path.join(root_dir, obj)) if f.endswith('.ply') and f != 'InitialMesh.ply']
             obj_samples.sort()
@@ -25,9 +26,13 @@ class EverydayDeformDataset(Dataset):
             elif split == 'val':
                 obj_split = obj_samples[train_samples:]
             self.samples.extend(obj_split)
+            self._mesh_paths[obj] = os.path.join(self.root_dir, obj, 'InitialMesh.ply')
 
-            soft_rest_mesh = o3d.io.read_triangle_mesh(os.path.join(self.root_dir, obj, 'InitialMesh.ply'))
-            self.soft_rest_mesh[obj] = soft_rest_mesh
+        # Resting meshes are loaded lazily in __getitem__ (only on a cache
+        # miss). Keeping Open3D out of __init__ means a training process with a
+        # fully-populated cache never touches Open3D at all, so fork-based
+        # DataLoader workers no longer inherit a broken Open3D state.
+        self.soft_rest_mesh = {}
 
         self.n_points = n_points
         self.neigbor_radius = neigbor_radius
@@ -35,6 +40,16 @@ class EverydayDeformDataset(Dataset):
         self.force_max = force_max
         self.graph_method = graph_method
         self.rigid_radius = sphere_radius
+
+        # Optional on-disk cache of precomputed graphs. When enabled, __getitem__
+        # loads a cached sample if present, otherwise computes it and saves it.
+        # Workers then never touch Open3D (which crashes forked processes), so
+        # num_workers > 0 becomes stable. The key encodes every param that
+        # affects the produced graphs so changing config invalidates the cache.
+        self.cache_dir = None
+        if cache_dir is not None:
+            params_key = f"n{n_points}_k{neigbor_k}_r{sphere_radius}_f{force_max}_{graph_method}"
+            self.cache_dir = os.path.join(cache_dir, params_key)
 
     def __len__(self):
         return len(self.samples)
@@ -49,12 +64,20 @@ class EverydayDeformDataset(Dataset):
         sample_path = self.samples[idx]
         obj_name = os.path.basename(os.path.dirname(sample_path))
 
+        cache_path = None
+        if self.cache_dir is not None:
+            cache_path = os.path.join(self.cache_dir, sample_path + ".pt")
+            if os.path.exists(cache_path):
+                return torch.load(cache_path, weights_only=False)
+
         meta_data = self._read_meta_data(sample_path)
         contact_point_np = meta_data['deformer_collision_position'].detach().numpy()
         rigid_mesh = _create_rigid_pointcloud(contact_point_np,self.rigid_radius)
         rigid_graph = mesh_to_graph(rigid_mesh)
         rigid_graph.x = _feature_rigid(meta_data, rigid_graph.x)
         soft_def_mesh = _load_deformed_mesh(sample_path, meta_data,self.root_dir)
+        if obj_name not in self.soft_rest_mesh:
+            self.soft_rest_mesh[obj_name] = o3d.io.read_triangle_mesh(self._mesh_paths[obj_name])
         soft_rest_mesh = copy.deepcopy(self.soft_rest_mesh[obj_name])
         soft_rest_mesh.translate(meta_data['object_rigid_pos'].detach().cpu().numpy())
         if self.n_points ==-1:
@@ -64,12 +87,22 @@ class EverydayDeformDataset(Dataset):
         soft_rest_graph = mesh_to_graph(sampled_soft_rest_mesh_o3d)
         soft_def_graph = mesh_to_graph(sampled_soft_def_mesh_o3d)
 
-        meta_data['rigid_mesh'] = rigid_mesh
-        meta_data['soft_rest_mesh'] = soft_rest_mesh
-        
+        # Store meshes as plain numpy arrays (picklable) so DataLoader workers
+        # can serialize them back to the main process; Open3D meshes are not
+        # picklable. eval.py rebuilds the Open3D meshes from these arrays.
+        meta_data['rigid_mesh_vertices'] = np.asarray(rigid_mesh.vertices).copy()
+        meta_data['rigid_mesh_triangles'] = np.asarray(rigid_mesh.triangles).copy()
+        meta_data['soft_rest_mesh_triangles'] = np.asarray(soft_rest_mesh.triangles).copy()
+
         meta_data['sample_path'] = sample_path
 
-        return obj_name, soft_rest_graph, soft_def_graph, meta_data, rigid_graph
+        result = (obj_name, soft_rest_graph, soft_def_graph, meta_data, rigid_graph)
+
+        if cache_path is not None:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            torch.save(result, cache_path)
+
+        return result
 
     def _read_meta_data(self, sample_path):
         with open(os.path.join(self.root_dir, sample_path + ".json"), "r") as f:

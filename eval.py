@@ -127,13 +127,22 @@ def eval():
                     if not os.path.exists(output_folder):
                         os.makedirs(output_folder)
 
-                    rigid_mesh = meta_data["rigid_mesh"][indx]
+                    rigid_mesh = o3d.geometry.TriangleMesh()
+                    rigid_mesh.vertices = o3d.utility.Vector3dVector(
+                        meta_data["rigid_mesh_vertices"][indx]
+                    )
+                    rigid_mesh.triangles = o3d.utility.Vector3iVector(
+                        meta_data["rigid_mesh_triangles"][indx]
+                    )
                     rigid_mesh_path = os.path.join(
                         "./outputs/", meta_data["sample_path"][indx] + "_rigid.obj"
                     )
                     o3d.io.write_triangle_mesh(rigid_mesh_path, rigid_mesh)
 
-                    soft_mesh = meta_data["soft_rest_mesh"][indx]
+                    soft_mesh = o3d.geometry.TriangleMesh()
+                    soft_mesh.triangles = o3d.utility.Vector3iVector(
+                        meta_data["soft_rest_mesh_triangles"][indx]
+                    )
 
                     # For resting
                     soft_mesh.vertices = o3d.utility.Vector3dVector(

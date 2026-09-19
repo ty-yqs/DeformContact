@@ -17,6 +17,7 @@ def load_dataset(config):
             sphere_radius =config.dataset.sphere_radius,
             force_max=config.dataset.force_max,
             split="train",
+            cache_dir=config.dataset.cache_dir,
         )
 
         val_dataset = EverydayDeformDataset(
@@ -29,6 +30,7 @@ def load_dataset(config):
             sphere_radius =config.dataset.sphere_radius,
             force_max=config.dataset.force_max,
             split="val",
+            cache_dir=config.dataset.cache_dir,
         )
     else:
         raise ValueError(f"Unknown dataset name: {config.dataset.name}")
@@ -38,6 +40,7 @@ def load_dataset(config):
         batch_size=config.dataloader.batch_size,
         shuffle=False,
         collate_fn=collate_fn,
+        num_workers=0,
     )
 
     dataloader_train = DataLoader(
@@ -45,6 +48,7 @@ def load_dataset(config):
         batch_size=config.dataloader.batch_size,
         shuffle=config.dataloader.shuffle,
         collate_fn=collate_fn,
+        num_workers=0,
     )
 
     return dataloader_train, dataloader_val

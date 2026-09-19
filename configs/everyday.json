@@ -3,12 +3,13 @@
         "name":"everyday",
         "root_dir": "dataset/everyday_deform/",
         "obj_list": ["Box","Cat","Pillow","Dog","Donut","Doritos","Bottle","Flipflop"],
-        "n_points": -1,
+        "n_points": 2048,
         "neigbor_radius": 0.15,
         "neigbor_k":5,
         "sphere_radius":0.05,
         "force_max":10000,
-        "graph_method":"knn"
+        "graph_method":"knn",
+        "cache_dir": "dataset/everyday_deform_cache/"
     },
     "visualization": {
         "rigid_radius_contact": 0.1,
@@ -23,7 +24,7 @@
         }
     },
     "dataloader": {
-        "batch_size": 4,
+        "batch_size": 8,
         "shuffle": true
     },
     "training": {

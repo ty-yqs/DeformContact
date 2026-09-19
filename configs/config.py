@@ -51,6 +51,7 @@ class DatasetConfig:
         self.neigbor_k = None
         self.force_max = None
         self.graph_method = None
+        self.cache_dir = None
 
 class VisualizationConfig:
     def __init__(self):
