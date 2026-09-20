@@ -35,6 +35,7 @@ Follow the on-screen instructions.
 
 4. **Download the dataset**
 Please download the dataset from [here](https://drive.google.com/file/d/1L9yuIvrlS3kb6GqaXGEzA68AEE5waDfX/view?usp=sharing) and place it in the following directory within the cloned repository.
+
    ```sh
     python visualize.py
 Ensure the config_path variable in the main function of visualize.py is set to the path of your config file.
@@ -47,15 +48,22 @@ Run the visualization script:
     python visualize.py
 Ensure the config_path variable in the main function of visualize.py is set to the path of your config file.
 
+6. **Precompute the data**
+Run the precompute script:
 
-6. **Train the Model**
+   ```sh
+    python precompute_dataset.py
+Ensure the config_path variable in the main function of precompute_dataset.py is set to the path of your config file.
+
+7. **Train the Model**
 Start model training:
+
    ```sh
     python train.py
 Ensure the config_path variable in the main function of train.py is set to the path of your config file.
 
-7. **Evaluate the Model**
+8. **Evaluate the Model**
 Evaluate the trained model:
+
    ```sh
     python eval.py
-
