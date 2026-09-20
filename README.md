@@ -20,9 +20,9 @@ This repository contains the implementation of a model that predicts deformation
 Replace username with your GitHub username and repository with the name of your repository.
 
 2. **Run Setup Script:**
+
    ```sh
     bash setup.sh
-
 This script will create and activate a conda environment named deform, and install the necessary packages.
 
 3. **Setup Weights & Biases:**
