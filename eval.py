@@ -1,39 +1,49 @@
-import torch
+import argparse
+import os
+import time
 
+import torch
+import torch.nn as nn
 from torch_geometric.data import Batch
+
 from utils.visualization import *
 from configs.config import Config
 from models.model_loader import load_model
 from models.losses import GradientConsistencyLoss
 from loaders.dataset_loader import load_dataset
-import wandb
-import os
-import torch.nn as nn
 from utils.graph_utils import *
 
 visualize = False
 
 
-import time
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate a DeformContact model from a local weights file."
+    )
+    parser.add_argument(
+        "--weights",
+        "-w",
+        type=str,
+        required=True,
+        help="Path to the local model weights file (.pth).",
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        type=str,
+        required=True,
+        help="Path to the config file (.json) used to train the model.",
+    )
+    return parser.parse_args()
 
 
-def eval_runtime():
-    run_id = input("Enter the wandb run ID (e.g. mahdi-slh/DeformContact/runs/XXXXXXX): ")
-    model_file_name = "model_weights.pth"
-    config_file_name = "config.json"
-
-    log_dir = f"./wandb/{run_id}/logs"
-
-    run = wandb.Api().run(run_id)
-    run.file(model_file_name).download(replace=True, root=log_dir)
-    run.file(config_file_name).download(replace=True, root=log_dir)
-
-    config = Config(os.path.join(log_dir, config_file_name))
+def eval_runtime(config_path, weights_path):
+    config = Config(config_path)
     _, dataloader_val = load_dataset(config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(config).to(device)
-    model.load_state_dict(torch.load(os.path.join(log_dir, "model_weights.pth")))
+    model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
 
     total_data_load_time = 0.0
@@ -70,35 +80,26 @@ def eval_runtime():
     print(f"Average Inference Time per Batch: {avg_inference_time:.6f} seconds")
 
 
-def eval():
-    run_id = input("Enter the wandb run ID (e.g. mahdi-slh/DeformContact/runs/XXXXXXX): ")
-    model_file_name = "model_weights.pth"
-    config_file_name = "config.json"
-
-    log_dir = f"./wandb/{run_id}/logs"
-
-    run = wandb.Api().run(run_id)
-    run.file(model_file_name).download(replace=True, root=log_dir)
-    run.file(config_file_name).download(replace=True, root=log_dir)
-
-    config = Config(os.path.join(log_dir, config_file_name))
+def eval(config_path, weights_path):
+    config = Config(config_path)
     _, dataloader_val = load_dataset(config)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model(config).to(device)
-    model.load_state_dict(torch.load(os.path.join(log_dir, "model_weights.pth")))
+    model.load_state_dict(torch.load(weights_path, map_location=device))
     model.eval()
 
     criterion_mse = nn.MSELoss()
-    criterion_grad = GradientConsistencyLoss()
     criterion_mae = nn.L1Loss()
 
-    total_mae, total_mse, total_consistency = 0.0, 0.0, 0.0
-    errors = []
+    # Accumulate metrics per object so each object category is reported
+    # separately. A single validation batch may mix several objects, so the
+    # batched predictions are split back into per-sample results via `.batch`.
+    obj_metrics = {}
 
     with torch.no_grad():
         for batch_idx, (
-            obj_name,
+            obj_names,
             soft_rest_graphs,
             soft_def_graphs,
             meta_data,
@@ -110,15 +111,44 @@ def eval():
 
             predictions = model(soft_rest_graphs_batched, rigid_graphs_batched)
 
-            loss_mse = criterion_mse(predictions.pos, soft_def_graphs_batched.pos)
-            loss_mae = criterion_mae(predictions.pos, soft_def_graphs_batched.pos)
+            node_batch = soft_def_graphs_batched.batch
+            edge_index = soft_def_graphs_batched.edge_index
 
-            loss_consistency = criterion_grad(predictions, soft_def_graphs_batched)
-            errors.append((predictions.pos - soft_def_graphs_batched.pos).cpu().numpy())
+            for sample_idx, obj in enumerate(obj_names):
+                node_mask = node_batch == sample_idx
+                pred_pos = predictions.pos[node_mask]
+                gt_pos = soft_def_graphs_batched.pos[node_mask]
 
-            total_mse += loss_mse.item()
-            total_consistency += loss_consistency.item()
-            total_mae += loss_mae.item()
+                loss_mse = criterion_mse(pred_pos, gt_pos).item()
+                loss_mae = criterion_mae(pred_pos, gt_pos).item()
+
+                # Per-sample gradient consistency, matching GradientConsistencyLoss
+                # but restricted to the edges belonging to this sample only.
+                edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
+                if edge_mask.sum() > 0:
+                    src = edge_index[0][edge_mask]
+                    dst = edge_index[1][edge_mask]
+                    edge_diffs_gt = soft_def_graphs_batched.pos[dst] - soft_def_graphs_batched.pos[src]
+                    edge_diffs_pred = predictions.pos[dst] - predictions.pos[src]
+                    cross_shape_diffs = (edge_diffs_gt - edge_diffs_pred).norm(p=2, dim=-1)
+                    loss_consistency = cross_shape_diffs.sum().item() / edge_mask.sum().item()
+                else:
+                    loss_consistency = 0.0
+
+                if obj not in obj_metrics:
+                    obj_metrics[obj] = {
+                        "mse_sum": 0.0,
+                        "mae_sum": 0.0,
+                        "consistency_sum": 0.0,
+                        "count": 0,
+                        "errors": [],
+                    }
+                m = obj_metrics[obj]
+                m["mse_sum"] += loss_mse
+                m["mae_sum"] += loss_mae
+                m["consistency_sum"] += loss_consistency
+                m["count"] += 1
+                m["errors"].append((pred_pos - gt_pos).cpu().numpy())
 
             if visualize:
                 for indx in range(config.dataloader.batch_size):
@@ -178,19 +208,55 @@ def eval():
                     # visualize_deformation_field(soft_rest_graphs[indx].pos.cpu(), predictions[indx].pos.cpu(),rigid_graphs[indx].pos.cpu(), meta_data['force_vector'][indx])
                     # visualize_merged_graphs(soft_rest_graphs[indx], soft_def_graphs_batched[indx], rigid_graphs[indx],predictions[indx])
 
-        avg_mae = loss_mae / len(dataloader_val)
-        avg_mse = total_mse / len(dataloader_val)
-        errors = np.concatenate(errors)
+    print("=" * 60)
+    for obj in sorted(obj_metrics.keys()):
+        m = obj_metrics[obj]
+        n = m["count"]
+        avg_mse = m["mse_sum"] / n
+        avg_mae = m["mae_sum"] / n
+        avg_consistency = m["consistency_sum"] / n
+        errors = np.concatenate(m["errors"])
         variance_of_error = np.var(errors)
-        avg_consistency = total_consistency / len(dataloader_val)
-        obj_name = config.dataset.obj_list[0]
-        print(f"Average MSE Error for {obj_name}: {avg_mse}")
-        print(f"Average Consistency Error for {obj_name}: {avg_consistency}")
-        print(f"Average MAE Error for {obj_name}: {avg_mae}")
-        print(f"Variance of MSE Error for {obj_name}: {variance_of_error}")
+        rmse = np.sqrt(np.mean(errors**2))
+        max_error = np.max(np.abs(errors))
+
+        print(f"Object: {obj} ({n} samples)")
+        print(f"  MSE:          {avg_mse:.6f}")
+        print(f"  RMSE:         {rmse:.6f}")
+        print(f"  MAE:          {avg_mae:.6f}")
+        print(f"  Consistency:  {avg_consistency:.6f}")
+        print(f"  Max Error:    {max_error:.6f}")
+        print(f"  Variance:     {variance_of_error:.6f}")
+        print("-" * 60)
+
+    # Aggregate all objects into an overall summary.
+    total_count = sum(m["count"] for m in obj_metrics.values())
+    if total_count > 0:
+        all_errors = np.concatenate(
+            [np.concatenate(m["errors"]) for m in obj_metrics.values()]
+        )
+        overall_mse = sum(m["mse_sum"] for m in obj_metrics.values()) / total_count
+        overall_mae = sum(m["mae_sum"] for m in obj_metrics.values()) / total_count
+        overall_consistency = (
+            sum(m["consistency_sum"] for m in obj_metrics.values()) / total_count
+        )
+        overall_rmse = np.sqrt(np.mean(all_errors**2))
+        overall_variance = np.var(all_errors)
+        overall_max_error = np.max(np.abs(all_errors))
+
+        print("=" * 60)
+        print(f"Total ({total_count} samples, {len(obj_metrics)} objects)")
+        print(f"  MSE:          {overall_mse:.6f}")
+        print(f"  RMSE:         {overall_rmse:.6f}")
+        print(f"  MAE:          {overall_mae:.6f}")
+        print(f"  Consistency:  {overall_consistency:.6f}")
+        print(f"  Max Error:    {overall_max_error:.6f}")
+        print(f"  Variance:     {overall_variance:.6f}")
+        print("=" * 60)
 
 
 if __name__ == "__main__":
 
-    eval()
-    # eval_runtime()
+    args = parse_args()
+    eval(args.config, args.weights)
+    # eval_runtime(args.config, args.weights)
