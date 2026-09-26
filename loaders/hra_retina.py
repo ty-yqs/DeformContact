@@ -334,6 +334,11 @@ class HraRetinaDataset(Dataset):
             # reporting / conditioning
             "contact_normal": unit_or_zero(meta["contact_normal"]),
             "clamp_z_m": float(meta["clamp_z_m"]),
+            # The rigid graph is built around this point, so it is also the
+            # contact centre -- the loss uses it to weight the contact region.
+            "needle_tip_mm": torch.tensor(
+                meta["needle_tip_position_m"], dtype=torch.float32
+            ) * self.length_scale,
             "force_n": float(meta["force"]),
             "has_contact": has_contact,
             "press_depth_m": float(meta["press_depth_m"]),

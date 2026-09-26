@@ -20,7 +20,7 @@ from torch_geometric.data import Batch
 
 from configs.config import Config
 from loaders.dataset_loader import load_dataset
-from models.losses import GradientConsistencyLoss
+from models.losses import GradientConsistencyLoss, WeightedL1Loss, displacement_weight
 from models.model_loader import load_model
 
 REQUIRED_CONFIG = [
@@ -31,6 +31,12 @@ REQUIRED_CONFIG = [
     "training.learning_rate",
     "network.input_dims",
 ]
+
+# A node at this displacement gets `1 + strength` times the weight of a static
+# node. 30 um is roughly where the baseline model's predictions start to fall
+# behind the ground truth (it reproduces only 39% above that).
+DEFAULT_WEIGHT_REF_UM = 30.0
+DEFAULT_CONTACT_SIGMA_MM = 1.0
 
 
 def parse_args():
@@ -45,6 +51,17 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--lambda-gradient", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--loss-weighting", default=None,
+                        choices=["none", "magnitude", "contact", "both"],
+                        help="weight the displacement loss towards the contact "
+                             "peak. 'none' (the default) is plain L1 and "
+                             "reproduces the unweighted run exactly.")
+    parser.add_argument("--loss-weight-strength", type=float, default=None,
+                        help="weight of a node at the reference displacement "
+                             "(or at zero distance from the tip)")
+    parser.add_argument("--loss-weight-base", type=float, default=None,
+                        help="weight of a static node; 1.0 keeps the bulk "
+                             "constrained, 0.0 hands the loss to the peaks")
     parser.add_argument("--device", default=None, help="cuda / cpu / cuda:1 ...")
     parser.add_argument("--limit-batches", type=int, default=None,
                         help="cap training batches per epoch (smoke runs)")
@@ -65,6 +82,12 @@ def build_config(args):
         updates.setdefault("training", {})["lambda_gradient"] = args.lambda_gradient
     if args.batch_size is not None:
         updates.setdefault("dataloader", {})["batch_size"] = args.batch_size
+    if args.loss_weighting is not None:
+        updates.setdefault("training", {})["loss_weighting"] = args.loss_weighting
+    if args.loss_weight_strength is not None:
+        updates.setdefault("training", {})["loss_weight_strength"] = args.loss_weight_strength
+    if args.loss_weight_base is not None:
+        updates.setdefault("training", {})["loss_weight_base"] = args.loss_weight_base
 
     config = Config(args.config, updates=updates or None)
     config.validate(REQUIRED_CONFIG)
@@ -84,12 +107,15 @@ def unpack(batch, device):
 
 
 def run_epoch(model, loader, device, criterion_mse, criterion_grad, lambda_gradient,
-              optimizer=None, limit_batches=None, collect_stats=False):
+              optimizer=None, limit_batches=None, collect_stats=False, weighting=None):
     """One pass. Trains when ``optimizer`` is given, otherwise evaluates.
 
     Returns ``(loss, stats)`` where the loss is weighted by sample count (a
     plain mean over batches would over-weight the last, partial batch) and
     ``stats`` holds micrometre diagnostics for this dataset.
+
+    ``weighting`` is the kwargs for ``displacement_weight``, or None for the
+    unweighted loss.
     """
     training = optimizer is not None
     model.train(training)
@@ -108,7 +134,16 @@ def run_epoch(model, loader, device, criterion_mse, criterion_grad, lambda_gradi
             predictions.pos = predictions.pos - soft_rest.pos
             soft_def.pos = soft_def.pos - soft_rest.pos
 
-            loss_mse = criterion_mse(predictions.pos, soft_def.pos)
+            if weighting is None:
+                loss_mse = criterion_mse(predictions.pos, soft_def.pos)
+            else:
+                tip = meta_data["needle_tip_mm"].to(device)[soft_rest.batch]
+                weight = displacement_weight(
+                    soft_def.pos,
+                    tip_dist=(soft_rest.pos - tip).norm(dim=-1),
+                    **weighting,
+                )
+                loss_mse = criterion_mse(predictions.pos, soft_def.pos, weight)
             loss_consistency = criterion_grad(predictions, soft_def)
             loss = loss_mse + lambda_gradient * loss_consistency
 
@@ -170,7 +205,36 @@ def main():
 
     model = load_model(config).to(device)
     optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
-    criterion_mse = nn.L1Loss()
+
+    scheme = (config.training.loss_weighting or "none").lower()
+    weighting = None
+    if scheme == "none":
+        criterion_mse = nn.L1Loss()
+    else:
+        strength = config.training.loss_weight_strength
+        ref_um = config.training.loss_weight_ref_um
+        sigma_mm = config.training.loss_contact_sigma_mm
+        base = config.training.loss_weight_base
+        strength = 1.0 if strength is None else float(strength)
+        ref_um = DEFAULT_WEIGHT_REF_UM if ref_um is None else float(ref_um)
+        sigma_mm = DEFAULT_CONTACT_SIGMA_MM if sigma_mm is None else float(sigma_mm)
+        base = 1.0 if base is None else float(base)
+        weighting = {
+            "scheme": scheme,
+            "strength": strength,
+            # um -> graph units: the working unit is length_scale x metres,
+            # i.e. mm, and 1 mm = 1e3 um.
+            "ref": ref_um * 1e-3,
+            "sigma": sigma_mm,
+            "base": base,
+        }
+        criterion_mse = WeightedL1Loss()
+        print(
+            "loss weighting: scheme={} base={} strength={} ref={} um sigma={} mm".format(
+                scheme, base, strength, ref_um, sigma_mm
+            )
+        )
+
     criterion_grad = GradientConsistencyLoss()
     lambda_gradient = config.training.lambda_gradient
 
@@ -191,11 +255,12 @@ def main():
         train_loss, train_stats = run_epoch(
             model, dataloader_train, device, criterion_mse, criterion_grad,
             lambda_gradient, optimizer=optimizer, limit_batches=args.limit_batches,
-            collect_stats=True,
+            collect_stats=True, weighting=weighting,
         )
         val_loss, val_stats = run_epoch(
             model, dataloader_val, device, criterion_mse, criterion_grad,
             lambda_gradient, limit_batches=args.max_val_batches, collect_stats=True,
+            weighting=weighting,
         )
 
         print(
