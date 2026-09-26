@@ -1,9 +1,12 @@
 .gitignore
 dataset/everyday_deform/*
 dataset/everyday_deform_cache/
+dataset/hra_dataset_large/
+dataset/hra_dataset_large.zip
 logs/*
 wandb/*
 outputs/*
+runs/*
 visualizations/*
 build/
 

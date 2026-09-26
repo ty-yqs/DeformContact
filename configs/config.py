@@ -40,6 +40,28 @@ class Config:
         with open(file_path, 'w') as config_file:
             json.dump(config_dict, config_file, indent=4)
 
+    def validate(self, required):
+        """Raise if any ``"section.attr"`` in ``required`` is still None.
+
+        ``_load_defaults`` silently drops JSON keys that have no matching
+        attribute, so a typo in a config file shows up later as a confusing
+        TypeError (e.g. ``range(None)``). Call this right after loading.
+        """
+        missing = []
+        for path in required:
+            section, _, attr = path.partition(".")
+            value = getattr(getattr(self, section, None), attr, None)
+            if value is None:
+                missing.append(path)
+        if missing:
+            raise ValueError(
+                "Config is missing required value(s): {}. Either the config "
+                "file omits them or they are not declared on the sub-config "
+                "class (unknown JSON keys are dropped silently).".format(
+                    ", ".join(sorted(missing))
+                )
+            )
+
 class DatasetConfig:
     def __init__(self):
         self.name = None
@@ -52,6 +74,22 @@ class DatasetConfig:
         self.force_max = None
         self.graph_method = None
         self.cache_dir = None
+        # HRA retina dataset (configs/hra_large.json). Everything below is
+        # ignored by the everyday loader.
+        self.n_points_mode = None
+        self.length_scale = None
+        self.rigid_n_points = None
+        self.press_depth_max = None
+        self.condition = None
+        self.split_ratio = None
+        self.split_seed = None
+        self.split_mode = None
+        self.manifest_name = None
+        self.filter_status = None
+        self.filter_hold_settled = None
+        self.filter_min_force = None
+        self.exclude_regression = None
+        self.preload = None
 
 class VisualizationConfig:
     def __init__(self):
@@ -70,6 +108,7 @@ class DataLoaderConfig:
     def __init__(self):
         self.batch_size = None
         self.shuffle = None
+        self.num_workers = None
 
 class TrainingConfig:
     def __init__(self):
@@ -78,6 +117,9 @@ class TrainingConfig:
         self.model_save_path =None
         self.lambda_gradient = None
         self.lambda_deformable = None
+        self.seed = None
+        self.output_dir = None
+        self.log_every = None
 
 class NetworkConfig:
     def __init__(self):
@@ -92,3 +134,4 @@ class NetworkConfig:
         self.use_mha = None
         self.num_mha_heads=None
         self.mode = None
+        self.mha_masked = False

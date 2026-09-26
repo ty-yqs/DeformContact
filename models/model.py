@@ -9,19 +9,35 @@ class MultiHeadAttention(nn.Module):
         super(MultiHeadAttention, self).__init__()
         self.num_heads = num_heads
         self.attention_heads = nn.ModuleList([nn.Linear(feature_dim, feature_dim) for _ in range(num_heads)])
-        
-    def forward(self, x_resting, x_rigid):
+
+    def forward(self, x_resting, x_rigid, batch_resting=None, batch_rigid=None):
+        # Batch.from_data_list concatenates every sample's nodes onto one node
+        # axis, so without the mask a resting node can attend to another
+        # sample's rigid nodes. That is harmless when each sample has its own
+        # resting geometry, but when the whole dataset shares one rest mesh
+        # (e.g. the HRA retina) the resting queries are identical across
+        # samples and every sample in the batch collapses onto the same output.
+        # batch_resting / batch_rigid are the usual PyG ``.batch`` vectors.
+        mask = None
+        if batch_resting is not None and batch_rigid is not None:
+            mask = batch_resting[:, None] != batch_rigid[None, :]
+
         outputs = []
         for head in self.attention_heads:
             scores = torch.mm(head(x_resting), head(x_rigid).transpose(0, 1))
+            if mask is not None:
+                scores = scores.masked_fill(mask, float("-inf"))
             attn_weights = F.softmax(scores, dim=-1)
+            if mask is not None:
+                # A row with every entry masked would softmax to NaN.
+                attn_weights = torch.nan_to_num(attn_weights)
             output = torch.mm(attn_weights, x_rigid)
             outputs.append(output)
 
         return torch.cat(outputs, dim=-1)
-    
+
 class GraphNet(nn.Module):
-    def __init__(self, input_dims, hidden_dim, output_dim, encoder_layers, decoder_layers, dropout_rate, knn_k, backbone,use_mha, num_mha_heads,mode):
+    def __init__(self, input_dims, hidden_dim, output_dim, encoder_layers, decoder_layers, dropout_rate, knn_k, backbone,use_mha, num_mha_heads,mode, mha_masked=False):
         super(GraphNet, self).__init__()
 
         self.encoder_layers = encoder_layers
@@ -31,6 +47,7 @@ class GraphNet(nn.Module):
         self.conv_layers_resting = nn.ModuleList()
         self.conv_layers_rigid = nn.ModuleList()
         self.use_mha = use_mha
+        self.mha_masked = mha_masked
 
         self.dropout_rate = dropout_rate
         self.knn_k = knn_k
@@ -79,7 +96,15 @@ class GraphNet(nn.Module):
 
         
 
-        pooled_features = self.multihead_attention(x_resting, x_rigid)
+        batch_resting = batch_rigid = None
+        if self.mha_masked:
+            # Plain (unbatched) Data has no .batch attribute.
+            batch_resting = getattr(graph_resting, "batch", None)
+            batch_rigid = getattr(graph_rigid, "batch", None)
+
+        pooled_features = self.multihead_attention(
+            x_resting, x_rigid, batch_resting, batch_rigid
+        )
 
         x_combined = torch.cat([x_resting, pooled_features], dim=-1)
 

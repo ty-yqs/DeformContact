@@ -1,0 +1,69 @@
+{
+    "dataset": {
+        "name": "hra",
+        "root_dir": "dataset/hra_dataset_large/",
+        "obj_list": ["retina"],
+        "n_points": -1,
+        "n_points_mode": "global",
+        "graph_method": "knn",
+        "neigbor_k": 6,
+        "neigbor_radius": 0.0015,
+        "sphere_radius": 0.00075,
+        "rigid_n_points": 256,
+        "force_max": 8.4255e-06,
+        "length_scale": 1000.0,
+        "press_depth_max": 7.5e-05,
+        "condition": "press_depth",
+        "split_ratio": 0.8,
+        "split_seed": 0,
+        "split_mode": "site",
+        "manifest_name": "manifest.csv",
+        "filter_status": "ok",
+        "filter_hold_settled": true,
+        "filter_min_force": 0.0,
+        "exclude_regression": true,
+        "preload": true,
+        "cache_dir": null
+    },
+    "visualization": {
+        "rigid_radius_contact": 0.1,
+        "rigid_radius_deform": 0.01,
+        "colors": {
+            "contact_rigid": [0, 0, 1],
+            "deform_rigid": [1, 1, 0],
+            "soft_rest_pcd": [1, 0, 0],
+            "soft_def_pcd": [0, 1, 0],
+            "lineset": [0.5, 0.5, 0.5],
+            "vector": [0, 0, 0]
+        }
+    },
+    "dataloader": {
+        "batch_size": 8,
+        "shuffle": true,
+        "num_workers": 0
+    },
+    "training": {
+        "n_epochs": 200,
+        "learning_rate": 0.0004,
+        "model_save_path": "runs/hra_large/model_weights.pth",
+        "lambda_gradient": 1.0,
+        "lambda_deformable": 0.1,
+        "seed": 0,
+        "output_dir": "runs/hra_large",
+        "log_every": 20
+    },
+    "network": {
+        "input_dims": [21, 25],
+        "use_mha": true,
+        "num_mha_heads": 2,
+        "hidden_dim": 256,
+        "output_dim": 3,
+        "encoder_layers": 2,
+        "decoder_layers": 3,
+        "dropout_rate": 0.00,
+        "knn_k": 7,
+        "backbone": "TAGConv",
+        "mode": "res",
+        "mha_masked": true
+    }
+}
