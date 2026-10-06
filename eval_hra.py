@@ -34,6 +34,12 @@ from models.model_loader import load_model
 
 UM_PER_UNIT = 1e3  # graph units are length_scale x metres (0.001 m -> 1 um)
 
+# Displacement bins for the peak report. The trained baseline reproduces only
+# 39% of the motion above 30 um and over-predicts the static bulk, and both are
+# invisible in a node-averaged MAE: 57% of the nodes move less than 0.5 um, so
+# they set the headline number while the contact peak carries 0.15% of the loss.
+PEAK_BINS_UM = [0.0, 0.5, 3.0, 10.0, 30.0, float("inf")]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -87,6 +93,10 @@ def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
 
     forward_time, prep_time, metric_time = 0.0, 0.0, 0.0
     timed_batches = timed_samples = timed_nodes = 0
+    n_bins = len(PEAK_BINS_UM) - 1
+    # count, sum |gt|, sum |pred| per bin, in um. Euclidean node norms, unlike
+    # the per-component mae_um above.
+    peaks = np.zeros((n_bins, 3))
     wall_start = time.perf_counter()
 
     with torch.no_grad():
@@ -121,6 +131,14 @@ def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
                 torch.as_tensor(meta_data["clamp_z_m"], device=device)[node_batch]
                 * clamp_scale
             )
+
+            gt_mag = (gt - soft_rest.pos).norm(dim=-1).cpu().numpy() * UM_PER_UNIT
+            pred_mag = (pred - soft_rest.pos).norm(dim=-1).cpu().numpy() * UM_PER_UNIT
+            bin_idx = np.digitize(gt_mag, PEAK_BINS_UM) - 1
+            for b in range(n_bins):
+                sel = bin_idx == b
+                if sel.any():
+                    peaks[b] += [sel.sum(), gt_mag[sel].sum(), pred_mag[sel].sum()]
 
             for sample_idx, case_id in enumerate(meta_data["case_id"]):
                 node_mask = node_batch == sample_idx
@@ -197,7 +215,7 @@ def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
         # batches. This is a floor on the pipeline, not the model's rate.
         "e2e_fps": rate(timed_samples, forward_time + prep_time + metric_time),
     }
-    return records, timing
+    return records, timing, peaks
 
 
 def summarize(records):
@@ -208,23 +226,39 @@ def summarize(records):
         values = [r[key] for r in records if r.get(key) is not None]
         return float(np.mean(values)) if values else float("nan")
 
+    def pooled(key):
+        """Node-weighted mean: the mean over all nodes, not over samples.
+
+        This is the definition ``train_hra.py`` uses (``sum|err| / sum|target|``)
+        and the one ``norm_err < 1`` agrees with ``mae_um < zero_base_um``.
+        """
+        pairs = [(r[key], r["n_nodes"]) for r in records if r.get(key) is not None]
+        den = sum(n for _, n in pairs)
+        return sum(v * n for v, n in pairs) / den if den else float("nan")
+
     # RMSE and max are recombined from per-sample values so they stay honest.
     rmse = float(np.sqrt(np.mean([r["rmse_um"] ** 2 for r in records])))
+    mae, base = pooled("mae_um"), pooled("zero_base_um")
+    active_mae, active_base = pooled("active_mae_um"), pooled("active_zero_base_um")
     summary = {
         "n_samples": len(records),
-        "mae_um": mean("mae_um"),
+        "mae_um": mae,
         "rmse_um": rmse,
         "max_um": float(np.max([r["max_um"] for r in records])),
-        "zero_base_um": mean("zero_base_um"),
-        "norm_err": mean("norm_err"),
+        "zero_base_um": base,
+        "norm_err": mae / base if base else float("nan"),
         "consistency_um": mean("consistency_um"),
-        "active_mae_um": mean("active_mae_um"),
-        "active_zero_base_um": mean("active_zero_base_um"),
-        "active_norm_err": mean("active_norm_err"),
+        "active_mae_um": active_mae,
+        "active_zero_base_um": active_base,
+        "active_norm_err": active_mae / active_base if active_base else float("nan"),
+        # The mean of the per-sample ratios is NOT the same number: a case whose
+        # retina barely moves has |target| -> 0, so its ratio blows up and drags
+        # the mean above 1 even when every aggregate says the model wins. Kept
+        # for reference only -- the median is the representative one.
+        "norm_err_sample_mean": mean("norm_err"),
+        "norm_err_sample_median": float(np.median([r["norm_err"] for r in records])),
     }
-    summary["beats_zero_baseline"] = bool(
-        summary["mae_um"] < summary["zero_base_um"]
-    )
+    summary["beats_zero_baseline"] = bool(summary["norm_err"] < 1.0)
     return summary
 
 
@@ -232,15 +266,18 @@ def print_block(title, summary, indent="  "):
     if summary is None:
         return
     print("{}{} ({} samples)".format(indent, title, summary["n_samples"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "MAE (um)", summary["mae_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "RMSE (um)", summary["rmse_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "Max error (um)", summary["max_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "zero baseline (um)", summary["zero_base_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "norm_err", summary["norm_err"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "consistency (um)", summary["consistency_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "MAE, active (um)", summary["active_mae_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "zero base, active (um)", summary["active_zero_base_um"]))
-    print("{}{:<22}{:>12.4f}".format(indent, "norm_err, active", summary["active_norm_err"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "MAE (um)", summary["mae_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "RMSE (um)", summary["rmse_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "Max error (um)", summary["max_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "zero baseline (um)", summary["zero_base_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "norm_err (node-weighted)", summary["norm_err"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "norm_err (per-case median)", summary["norm_err_sample_median"]))
+    print("{}{:<26}{:>12}".format(
+        indent, "beats zero baseline", "yes" if summary["beats_zero_baseline"] else "NO"))
+    print("{}{:<26}{:>12.4f}".format(indent, "consistency (um)", summary["consistency_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "MAE, active (um)", summary["active_mae_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "zero base, active (um)", summary["active_zero_base_um"]))
+    print("{}{:<26}{:>12.4f}".format(indent, "norm_err, active", summary["active_norm_err"]))
 
 
 def print_speed(timing, indent="  "):
@@ -262,6 +299,31 @@ def print_speed(timing, indent="  "):
     print("{}{:<30}{:>12.2f}".format(indent, "pipeline fps (incl. metrics)", timing["e2e_fps"]))
 
 
+def print_peaks(peaks, indent="  "):
+    """How much of each displacement band the model actually reproduces.
+
+    This is the headline diagnostic, not the MAE: a node-averaged error cannot
+    distinguish "predicts nothing" from "predicts the bulk and misses the
+    contact peak", and the second is the failure mode here.
+    """
+    total = peaks[:, 0].sum()
+    if not total:
+        return
+    print("{}{:<14}{:>9}{:>9}{:>11}{:>11}{:>9}".format(
+        indent, "GT |disp|", "nodes", "node %", "mean GT", "mean pred", "ratio"))
+    for b in range(len(PEAK_BINS_UM) - 1):
+        count, gt_sum, pred_sum = peaks[b]
+        if not count:
+            continue
+        lo, hi = PEAK_BINS_UM[b], PEAK_BINS_UM[b + 1]
+        label = ("{:.1f}-{:.1f} um".format(lo, hi) if hi != float("inf")
+                 else ">{:.0f} um".format(lo))
+        print("{}{:<14}{:>9}{:>8.1f}%{:>11.3f}{:>11.3f}{:>9.3f}".format(
+            indent, label, int(count), 100 * count / total,
+            gt_sum / count, pred_sum / count, pred_sum / gt_sum,
+        ))
+
+
 def group_by(records, key):
     groups = {}
     for record in records:
@@ -269,7 +331,7 @@ def group_by(records, key):
     return groups
 
 
-def report(split_name, records, timing=None):
+def report(split_name, records, timing=None, peaks=None):
     print("=" * 64)
     summary = summarize(records)
     if summary is None:
@@ -279,6 +341,8 @@ def report(split_name, records, timing=None):
     print_block("overall", summary)
     print("-" * 64)
     print_speed(timing)
+    print("-" * 64)
+    print_peaks(peaks)
 
     print("-" * 64)
     # README: snap_through is bistable and path dependent, so an average over
@@ -325,14 +389,15 @@ def main():
     if args.split in ("train", "all"):
         splits.append(("train", dataloader_train))
 
-    all_summaries, all_records, all_speeds = {}, {}, {}
+    all_summaries, all_records, all_speeds, all_peaks = {}, {}, {}, {}
     for name, loader in splits:
-        records, timing = evaluate(
+        records, timing, peaks = evaluate(
             model, loader, clamp_scale, device, limit=args.limit, warmup=args.warmup
         )
         all_records[name] = records
         all_speeds[name] = timing
-        all_summaries[name] = report(name, records, timing)
+        all_peaks[name] = peaks.tolist()
+        all_summaries[name] = report(name, records, timing, peaks)
 
     if args.per_case_csv:
         os.makedirs(os.path.dirname(os.path.abspath(args.per_case_csv)), exist_ok=True)
@@ -354,6 +419,11 @@ def main():
                     "config": args.config,
                     "summaries": all_summaries,
                     "speed": all_speeds,
+                    # inf is not valid JSON; None marks the open-ended last bin.
+                    "peaks": {
+                        "bins_um": [b if b != float("inf") else None for b in PEAK_BINS_UM],
+                        "per_split": all_peaks,
+                    },
                 },
                 handle,
                 indent=4,

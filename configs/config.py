@@ -120,6 +120,12 @@ class TrainingConfig:
         self.seed = None
         self.output_dir = None
         self.log_every = None
+        # Displacement-loss weighting. "none" keeps plain nn.L1Loss.
+        self.loss_weighting = None
+        self.loss_weight_strength = None
+        self.loss_weight_ref_um = None
+        self.loss_contact_sigma_mm = None
+        self.loss_weight_base = None
 
 class NetworkConfig:
     def __init__(self):
