@@ -1,11 +1,16 @@
-"""Train DeformContact on ``dataset/hra_dataset_large``.
+"""Train DeformContact on an HRA retina set.
 
 Same loss and loop as ``train.py``, but driven by a config path passed on the
 command line, checkpoints written to a real output directory (no wandb
 required), and per-epoch diagnostics reported in micrometres.
 
+The defaults point at ``dataset/hra_dataset_fundus`` -- the generation whose
+sites are actually in the deformable fundus cup. ``hra_dataset_large`` put
+every site inside the scene's clamped rigid band and is superseded; pass
+``--config configs/hra_large.json`` explicitly to reproduce it.
+
 Usage:
-    python train_hra.py --config configs/hra_large.json --output-dir runs/hra_large
+    python train_hra.py --config configs/hra_fundus.json --output-dir runs/hra_fundus
 """
 import argparse
 import json
@@ -43,7 +48,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--config", "-c", default="configs/hra_large.json")
+    parser.add_argument("--config", "-c", default="configs/hra_fundus.json")
     parser.add_argument("--output-dir", "-o", default=None,
                         help="default: config.training.output_dir")
     parser.add_argument("--epochs", type=int, default=None)
@@ -62,6 +67,11 @@ def parse_args():
     parser.add_argument("--loss-weight-base", type=float, default=None,
                         help="weight of a static node; 1.0 keeps the bulk "
                              "constrained, 0.0 hands the loss to the peaks")
+    parser.add_argument("--loss-contact-sigma-mm", type=float, default=None,
+                        help="falloff of the 'contact' scheme: a node at this "
+                             "distance from the tip gets 1/e of the bonus. On "
+                             "this dataset the moving nodes sit at 0.26-1.23 mm "
+                             "(median 0.55), so 1.0 mm is broad")
     parser.add_argument("--device", default=None, help="cuda / cpu / cuda:1 ...")
     parser.add_argument("--limit-batches", type=int, default=None,
                         help="cap training batches per epoch (smoke runs)")
@@ -88,6 +98,8 @@ def build_config(args):
         updates.setdefault("training", {})["loss_weight_strength"] = args.loss_weight_strength
     if args.loss_weight_base is not None:
         updates.setdefault("training", {})["loss_weight_base"] = args.loss_weight_base
+    if args.loss_contact_sigma_mm is not None:
+        updates.setdefault("training", {})["loss_contact_sigma_mm"] = args.loss_contact_sigma_mm
 
     config = Config(args.config, updates=updates or None)
     config.validate(REQUIRED_CONFIG)
@@ -176,6 +188,27 @@ def run_epoch(model, loader, device, criterion_mse, criterion_grad, lambda_gradi
     return total_loss / total_samples, stats
 
 
+def build_scheduler(optimizer, config):
+    """LR decay selected by ``training.lr_schedule``, or None for fixed LR.
+
+    The archived HRA runs used a fixed LR and checkpointed on best-of-epoch
+    while the val loss swung 4-5x between adjacent epochs, so which epoch got
+    saved was noise. Annealing gives the run a converged end state instead.
+    """
+    scheme = (config.training.lr_schedule or "none").lower()
+    if scheme == "none":
+        return None
+    if scheme != "cosine":
+        raise ValueError("Unknown training.lr_schedule: {!r}".format(scheme))
+    ratio = config.training.min_lr_ratio
+    ratio = 0.1 if ratio is None else float(ratio)
+    return optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, int(config.training.n_epochs)),
+        eta_min=float(config.training.learning_rate) * ratio,
+    )
+
+
 def main():
     args = parse_args()
     config = build_config(args)
@@ -205,6 +238,17 @@ def main():
 
     model = load_model(config).to(device)
     optimizer = optim.Adam(model.parameters(), lr=config.training.learning_rate)
+    scheduler = build_scheduler(optimizer, config)
+    if scheduler is not None:
+        print(
+            "lr schedule: cosine {:.2e} -> {:.2e} over {} epochs".format(
+                float(config.training.learning_rate),
+                float(config.training.learning_rate)
+                * (0.1 if config.training.min_lr_ratio is None
+                   else float(config.training.min_lr_ratio)),
+                int(config.training.n_epochs),
+            )
+        )
 
     scheme = (config.training.loss_weighting or "none").lower()
     weighting = None
@@ -257,6 +301,9 @@ def main():
             lambda_gradient, optimizer=optimizer, limit_batches=args.limit_batches,
             collect_stats=True, weighting=weighting,
         )
+        if scheduler is not None:
+            # Step on the train pass only; the val pass has no optimizer.
+            scheduler.step()
         val_loss, val_stats = run_epoch(
             model, dataloader_val, device, criterion_mse, criterion_grad,
             lambda_gradient, limit_batches=args.max_val_batches, collect_stats=True,

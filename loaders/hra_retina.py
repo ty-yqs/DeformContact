@@ -1,12 +1,23 @@
-"""Dataset for ``dataset/hra_dataset_large`` (HRA retina needle indentation).
+"""Dataset for the HRA retina needle-indentation sets.
 
-One sample is a single static end state: a shared rest mesh (``rest.npy``,
-5389 nodes) plus a per-case displacement field (``retina_displacement.npy``).
-Unlike ``everyday_deform`` there is no ``.ply`` per sample, no per-object
-sub-directory, and **no triangle connectivity** -- the ``.msh`` the dataset
-README points at is not part of the dataset. Graphs are therefore built from
-bare points with ``construct_graph_kdtree`` (scipy cKDTree; the
-``pyg_nn.knn_graph`` path needs ``torch-cluster``, which is not installed).
+Two generations live side by side and they are not interchangeable:
+
+``hra_dataset_large``
+    The scene clamped the *fundus* (rigid below ``clamp_z_m``), so every one of
+    its 1409 samples landed in the clamped band -- they pressed the ora serrata
+    rim, not the fundus -- and 51% of them were ``snap_through``.
+``hra_dataset_fundus``
+    The clamp was inverted (rigid above ``clamp_z_m``), putting all 2800 sites
+    in the deformable cup floor, and all of them are ``elastic``. This is the
+    generation the README describes as correct.
+
+Both share one rest mesh (``rest.npy``, 5389 nodes, byte-identical between the
+two) with a per-case displacement field (``retina_displacement.npy``). Unlike
+``everyday_deform`` there is no ``.ply`` per sample, no per-object
+sub-directory, and **no triangle connectivity** -- the ``.msh`` the README
+points at is not part of the dataset. Graphs are therefore built from bare
+points with ``construct_graph_kdtree`` (scipy cKDTree; the ``pyg_nn.knn_graph``
+path needs ``torch-cluster``, which is not installed).
 
 The class returns the same 5-tuple as ``EverydayDeformDataset`` so that
 ``loaders.collate.collate_fn``, the loss in ``train.py`` and the metric code in
@@ -26,9 +37,14 @@ from loaders.common import _feature_rigid
 from utils.pointcloud_utils import construct_graph_kdtree
 from utils.pos_encoding import to_log_freq
 
-# Tilt and azimuth only orient the needle: at tilt 0 the azimuth is meaningless,
-# so the four tilt-0 azimuth cases of a site are bit-identical replays
-# (max|diff| ~ 1e-17). Grouping the split by site keeps them together.
+# Tilt and azimuth both orient the needle, and on hra_dataset_large the four
+# tilt-0 azimuth cases of a site were bit-identical replays, so grouping the
+# split by site kept them together. On hra_dataset_fundus that premise is gone:
+# only 8% of the tilt-0 azimuth pairs are replays (median difference 11.5 um,
+# max 81.7 um), because the bevel roll follows the azimuth. Site grouping is
+# still what the split must do -- adjacent sites are 1.35 mm apart while the
+# dent is only ~0.75 mm wide, so a per-sample split would put neighbouring
+# views of the same contact geometry on both sides.
 REGIME_ELASTIC = "elastic"
 
 
@@ -44,14 +60,23 @@ def fibonacci_sphere(n):
 
 
 def read_manifest(path, status="ok", hold_settled=True, min_force=0.0,
-                  exclude_regression=True):
+                  exclude_regression=True, min_disp_ratio=None):
     """Filtered manifest rows.
 
     The README's recommended gates: keep ``status == "ok"``, drop cases whose
     hold-phase force is still ringing (``hold_settled != 1``), drop the
-    degenerate zero-contact cases, and drop the regression case. The 32
-    ``failed`` rows have empty strings in every numeric column, so they must be
-    filtered before any ``float()``.
+    degenerate zero-contact cases, and drop the regression case. Rejected rows
+    have empty strings in every numeric column, so they must be filtered before
+    any ``float()``.
+
+    ``min_disp_ratio`` additionally drops the "grab and release" cases: the
+    driver's own gate compares ``max_disp_m``, which is the peak over the whole
+    1201-frame trajectory, so a case that reaches the commanded depth during
+    the press and then lets go before the sample frame still passes it. Those
+    give one pose two different depths, i.e. an ambiguous regression target.
+    The ratio is sample-frame ``max |retina_displacement| / press_depth``, which
+    is not a manifest column, so this reads one ``.npy`` per surviving candidate
+    (~0.6 s over the 2800 fundus cases). ``None`` skips it entirely.
     """
     with open(path, newline="") as handle:
         rows = list(csv.DictReader(handle))
@@ -67,46 +92,36 @@ def read_manifest(path, status="ok", hold_settled=True, min_force=0.0,
         if min_force is not None and float(row["force_n"]) <= min_force:
             continue
         kept.append(row)
+
+    if min_disp_ratio is not None:
+        root = os.path.dirname(os.path.abspath(path))
+        gated = []
+        for row in kept:
+            disp = np.load(
+                os.path.join(root, row["case_id"], "retina_displacement.npy")
+            )
+            peak = float(np.linalg.norm(disp, axis=1).max())
+            if peak / (float(row["press_depth_um"]) * 1e-6) >= min_disp_ratio:
+                gated.append(row)
+        kept = gated
     return kept
 
 
-def stratified_site_split(rows, split_ratio=0.8, seed=0,
-                          site_keys=("site_x_mm", "site_y_mm"),
-                          regime_key="regime"):
-    """Split rows 4:1, holding out whole needle sites, stratified by regime.
-
-    Every site carries all 32 (tilt, azimuth, press depth) combinations, so a
-    per-sample split would put the same site in train and val at 32 different
-    angles. Grouping by site fixes that, but the per-site elastic fraction
-    ranges from 0.0 to 1.0 (7 sites are all-elastic, 7 are all-snap-through),
-    so an unstratified site shuffle swings the regime mix by ~17 points. This
-    walks the site list from both ends of the elastic-fraction ordering so the
-    running val mix tracks the global one.
-
-    Returns ``(train_rows, val_rows)``, both sorted by ``case_id``.
-    """
+def _site_groups(rows, site_keys):
     groups = {}
     for row in rows:
         groups.setdefault(tuple(row[k] for k in site_keys), []).append(row)
+    return groups
 
-    target_val = (1.0 - split_ratio) * len(rows)
-    ordered = sorted(
-        groups.items(),
-        key=lambda kv: (sum(r[regime_key] == REGIME_ELASTIC for r in kv[1]) / len(kv[1]), kv[0]),
-    )
 
-    # Alternate low-elastic / high-elastic groups so the extremes cancel out,
-    # then keep the prefix whose sample count lands closest to the target --
-    # sites hold 15..32 cases each, so stopping at the first crossing can
-    # overshoot by a couple of points of the ratio.
-    sequence, low, high = [], 0, len(ordered) - 1
-    while low <= high:
-        sequence.append(ordered[low][0])
-        low += 1
-        if low <= high:
-            sequence.append(ordered[high][0])
-            high -= 1
+def _pick_val_sites(groups, sequence, target_val):
+    """Take the prefix of ``sequence`` closest to ``target_val``, then swap.
 
+    Whole sites hold 24..36 cases each, so the prefix alone can only land within
+    ~1 point of the ratio. Trade one val group for one unselected group at a
+    time while that strictly improves the count; the error decreases every pass,
+    so this terminates.
+    """
     running, best_cut, best_err = 0, 0, float("inf")
     for cut, key in enumerate(sequence, start=1):
         running += len(groups[key])
@@ -115,10 +130,6 @@ def stratified_site_split(rows, split_ratio=0.8, seed=0,
             best_cut, best_err = cut, error
     val_set = set(sequence[:best_cut])
 
-    # Whole sites hold 15..32 cases, so the prefix alone can only land within
-    # ~1 point of the ratio. Trade one val group for one unselected group at a
-    # time while that strictly improves the count; the error decreases every
-    # pass, so this terminates.
     def val_count():
         return sum(len(groups[k]) for k in val_set)
 
@@ -126,7 +137,11 @@ def stratified_site_split(rows, split_ratio=0.8, seed=0,
         current = val_count()
         best_swap, swap_err = None, abs(current - target_val)
         candidates = [k for k in sequence if k not in val_set]
-        for out_key in val_set:
+        # Walk the selected keys in ``sequence`` order, not set order: a set of
+        # string tuples iterates in an order that depends on PYTHONHASHSEED, so
+        # the first strictly-improving swap found would differ between
+        # processes and hand two runs different (both legal) val splits.
+        for out_key in [k for k in sequence if k in val_set]:
             for in_key in candidates:
                 error = abs(
                     current - len(groups[out_key]) + len(groups[in_key]) - target_val
@@ -137,10 +152,76 @@ def stratified_site_split(rows, split_ratio=0.8, seed=0,
             break
         val_set.discard(best_swap[0])
         val_set.add(best_swap[1])
+    return val_set
+
+
+def _split_from_val_set(groups, val_set):
     train = sorted([r for k, v in groups.items() if k not in val_set for r in v],
                    key=lambda r: r["case_id"])
     val = sorted([r for k in val_set for r in groups[k]], key=lambda r: r["case_id"])
     return train, val
+
+
+def stratified_site_split(rows, split_ratio=0.8, seed=0,
+                          site_keys=("site_x_mm", "site_y_mm"),
+                          regime_key="regime"):
+    """Split rows 4:1, holding out whole needle sites, stratified by regime.
+
+    Every site carries many (tilt, azimuth, press depth) combinations, so a
+    per-sample split would put the same site in train and val at many different
+    angles. Grouping by site fixes that, but on ``hra_dataset_large`` the
+    per-site elastic fraction ranged from 0.0 to 1.0, so an unstratified site
+    shuffle swung the regime mix by ~17 points. This walks the site list from
+    both ends of the elastic-fraction ordering so the running val mix tracks the
+    global one.
+
+    Note the ``seed`` is unused: the walk is fully determined by the elastic
+    fractions. On a dataset where every case has the same regime -- such as
+    ``hra_dataset_fundus``, which is 100% elastic -- the fractions all tie and
+    the ordering collapses to site coordinates, which hands val a *contiguous
+    band* of sites rather than a random sample. Use ``random_site_split`` there.
+
+    Returns ``(train_rows, val_rows)``, both sorted by ``case_id``.
+    """
+    groups = _site_groups(rows, site_keys)
+    target_val = (1.0 - split_ratio) * len(rows)
+    ordered = sorted(
+        groups.items(),
+        key=lambda kv: (sum(r[regime_key] == REGIME_ELASTIC for r in kv[1]) / len(kv[1]), kv[0]),
+    )
+
+    # Alternate low-elastic / high-elastic groups so the extremes cancel out.
+    sequence, low, high = [], 0, len(ordered) - 1
+    while low <= high:
+        sequence.append(ordered[low][0])
+        low += 1
+        if low <= high:
+            sequence.append(ordered[high][0])
+            high -= 1
+
+    return _split_from_val_set(groups, _pick_val_sites(groups, sequence, target_val))
+
+
+def random_site_split(rows, split_ratio=0.8, seed=0,
+                      site_keys=("site_x_mm", "site_y_mm")):
+    """Split rows 4:1, holding out whole needle sites chosen at random.
+
+    The right protocol whenever the stratification key has no signal -- e.g.
+    ``hra_dataset_fundus``, where ``regime`` is ``elastic`` for all 2800 cases,
+    so ``stratified_site_split`` degenerates into a coordinate-ordered walk and
+    val comes out as a mid-depth band (train spanning z -18.07..-14.98 mm but
+    val only -16.98..-15.18). Drawing the sites with ``seed`` instead gives val
+    sites the same spatial distribution as train sites, which is what "hold out
+    20%" is supposed to mean.
+
+    Returns ``(train_rows, val_rows)``, both sorted by ``case_id``.
+    """
+    groups = _site_groups(rows, site_keys)
+    target_val = (1.0 - split_ratio) * len(rows)
+    keys = sorted(groups)
+    sequence = [keys[i] for i in np.random.RandomState(seed).permutation(len(keys))]
+    return _split_from_val_set(groups, _pick_val_sites(groups, sequence, target_val))
+
 
 
 def random_split(rows, split_ratio=0.8, seed=0):
@@ -199,7 +280,9 @@ class HraRetinaDataset(Dataset):
         filter_status="ok",
         filter_hold_settled=True,
         filter_min_force=0.0,
+        filter_min_disp_ratio=None,
         exclude_regression=True,
+        use_needle_pose=False,
         preload=True,
         cache_dir=None,
     ):
@@ -213,6 +296,7 @@ class HraRetinaDataset(Dataset):
         self.force_max = float(force_max)
         self.condition = condition
         self.n_points = n_points
+        self.use_needle_pose = bool(use_needle_pose)
         # None -> use the case's physical needle tip radius.
         self.sphere_radius = None if sphere_radius is None else float(sphere_radius)
 
@@ -222,9 +306,12 @@ class HraRetinaDataset(Dataset):
             hold_settled=filter_hold_settled,
             min_force=filter_min_force,
             exclude_regression=exclude_regression,
+            min_disp_ratio=filter_min_disp_ratio,
         )
         if split_mode == "site":
             train_rows, val_rows = stratified_site_split(rows, split_ratio, split_seed)
+        elif split_mode == "site_random":
+            train_rows, val_rows = random_site_split(rows, split_ratio, split_seed)
         elif split_mode == "random":
             train_rows, val_rows = random_split(rows, split_ratio, split_seed)
         else:
@@ -280,7 +367,7 @@ class HraRetinaDataset(Dataset):
         val_ids = {r["case_id"] for r in val_rows}
         if train_ids & val_ids:
             raise AssertionError("train and val share cases")
-        if split_mode == "site":
+        if split_mode in ("site", "site_random"):
             train_sites = {(r["site_x_mm"], r["site_y_mm"]) for r in train_rows}
             val_sites = {(r["site_x_mm"], r["site_y_mm"]) for r in val_rows}
             if train_sites & val_sites:
@@ -311,6 +398,41 @@ class HraRetinaDataset(Dataset):
         with open(os.path.join(self._case_dir(row), "meta.json")) as handle:
             return json.load(handle)
 
+    @staticmethod
+    def _bevel_dir(meta):
+        """Unit vector giving the bevel's roll about the needle axis.
+
+        ``needle_direction`` fixes the needle's *axis* but says nothing about
+        how the needle is rolled about that axis. At ``tilt_deg == 0`` the four
+        azimuth cases of a site therefore share one direction vector
+        bit-for-bit while their targets differ by up to 67.7 um (median 8.6) --
+        889 of the 2799 fundus cases (31.8%) collapse onto 2140 distinct inputs
+        without this feature. The bevel tip sits one needle radius off the
+        axis, so ``needle_centre - needle_tip`` projected perpendicular to the
+        axis recovers the roll directly: its magnitude is the needle radius
+        (155.5 um, constant across cases) and its direction rotates with the
+        azimuth, separating all 230 degenerate input groups.
+
+        Returns a zero vector if the field is missing or degenerate, which
+        makes the feature inert rather than crashing on an older dataset.
+        """
+        centre = meta.get("needle_centre_position_m")
+        tip = meta.get("needle_tip_position_m")
+        axis = meta.get("needle_direction")
+        if centre is None or tip is None or axis is None:
+            return torch.zeros(3, dtype=torch.float32)
+        axis = np.asarray(axis, dtype=np.float64)
+        norm = np.linalg.norm(axis)
+        if norm == 0.0:
+            return torch.zeros(3, dtype=torch.float32)
+        axis = axis / norm
+        offset = np.asarray(centre, dtype=np.float64) - np.asarray(tip, dtype=np.float64)
+        lateral = offset - float(offset @ axis) * axis
+        lateral_norm = np.linalg.norm(lateral)
+        if lateral_norm == 0.0:
+            return torch.zeros(3, dtype=torch.float32)
+        return torch.tensor(lateral / lateral_norm, dtype=torch.float32)
+
     def _build_meta_data(self, row, meta):
         """Fixed schema: every tensor key must have the same shape per sample,
         because ``collate_fn`` stacks tensor-valued keys unconditionally."""
@@ -331,6 +453,8 @@ class HraRetinaDataset(Dataset):
             # consumed by _feature_rigid
             "force": scalar,
             "force_vector": direction,
+            # Consumed only when ``use_needle_pose`` is set; see _bevel_dir.
+            "needle_bevel_dir": self._bevel_dir(meta),
             # reporting / conditioning
             "contact_normal": unit_or_zero(meta["contact_normal"]),
             "clamp_z_m": float(meta["clamp_z_m"]),
@@ -398,8 +522,16 @@ class HraRetinaDataset(Dataset):
         radius = self._rigid_radius(meta)
         rigid_pos = self.rigid_dirs * radius + tip
         meta_data = self._build_meta_data(row, meta)
+        rigid_x = _feature_rigid(meta_data, to_log_freq(rigid_pos, 3, 1))
+        if self.use_needle_pose:
+            # Appended here rather than inside _feature_rigid, which everyday
+            # also calls and whose 25-wide layout its pins depend on.
+            rigid_x = torch.cat(
+                [rigid_x, meta_data["needle_bevel_dir"].repeat(rigid_pos.shape[0], 1)],
+                dim=1,
+            )
         rigid_graph = Data(
-            x=_feature_rigid(meta_data, to_log_freq(rigid_pos, 3, 1)),
+            x=rigid_x,
             edge_index=self.rigid_edge_index,
             pos=rigid_pos,
         )

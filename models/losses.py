@@ -2,6 +2,23 @@ import torch
 import torch.nn as nn
 
 class GradientConsistencyLoss(nn.Module):
+    """Mean edge-wise mismatch between the predicted and true displacement fields.
+
+    Read the parameter names with care. Despite ``soft_rest_graphs_batched``,
+    both call sites (``train.py:53`` and ``train_hra.py:161``) pass the ground
+    truth *after* it has been converted to displacement space -- the call is
+    ``criterion_grad(predictions, soft_def)`` with both already offset by the
+    rest positions. So this compares the two displacement fields' edge
+    differences against each other; it is not a smoothness prior on the
+    prediction relative to the rest mesh.
+
+    It is therefore a matching term: zero when the prediction equals the target,
+    and largest when predicting nothing at all. Assuming the rest graph made it
+    look like a penalty on reproducing a sharp deformation, which inverts the
+    conclusion about which ``lambda_gradient`` values are safe -- it never
+    penalises reproducing the target, at any weight.
+    """
+
     def __init__(self):
         super(GradientConsistencyLoss, self).__init__()
 
@@ -60,11 +77,46 @@ def displacement_weight(target_disp, scheme="none", strength=1.0, ref=None,
     39x more of the loss on the peak bought 11% on the peak, while ``base=0``
     let the 57% static bulk drift to 15.6x over-prediction and pushed the model
     past the zero baseline (norm_err > 1). The contact scheme moved nothing
-    (0.15% -> 0.27%). So the under-prediction is not an optimization-incentive
-    problem: the peak is largely predictable from the commanded press depth
-    alone (corr 0.897, ~20% spread within a depth), so the information is
-    present in the inputs and the model is failing to represent it. Look at the
-    decoder/output parameterisation, not the loss.
+    (0.15% -> 0.27%).
+
+    Those three runs were on ``hra_dataset_large``, and that is why the
+    weighting looked inert: there 0.37% of nodes move more than 30 um, so plain
+    L1 is only mildly lopsided. On ``hra_dataset_fundus`` the imbalance is 15x
+    worse -- 0.024% of nodes, a median of *3 nodes out of 5389*, which makes the
+    unweighted loss a 1355:1 vote against the dent. Outputting zero is the
+    rational optimum, and that is what the model converges to.
+
+    Weighting does not fix it either. Four 40-epoch runs on fundus, none of
+    which beat the zero baseline (norm_err 1.0):
+
+        arm                          vote ratio  >30um ratio  norm_err
+        none (plain L1)                    1355        0.002       7.9
+        magnitude base=1 s=200                8        0.439      39.0
+        both base=0.1 s=50 sigma=0.4          4        0.129      21.7
+        both base=0.1 s=200 sigma=0.4         2        0.342     120.6
+
+    The peak ratio rises, but norm_err rises with it: the model answers more
+    weight on the peak by *inflating the whole field*, not by localising. Its
+    prediction is near-constant (0.1-2 um everywhere), so scaling it up lifts
+    the peak and the 5380 static nodes together.
+
+    That is the real failure, and it is representational. The target's spatial
+    contrast -- std/mean of |disp| -- is 46 (train median 45.8, p10-p90
+    41.7-54.3): six or seven nodes above 1 um carrying a 100 um peak. Every
+    configuration tried produces 0.06-0.27, including 3000 epochs of overfitting
+    4 samples with the static bulk removed from the loss entirely. Nothing the
+    loss can say makes the model produce a field that sharp.
+
+    ``overfit_test.py`` originally reported that last run as "FITS ... the
+    architecture can express this target"; it checked only peak_pred/peak_gt,
+    which an inflated field satisfies trivially. It now also requires norm_err
+    < 1 and a minimum spatial contrast, and labels that outcome INFLATED.
+
+    Where the sharpness goes: ``GraphNet`` puts the resting features through two
+    TAGConv layers (each a diffusion) before the decoder ever sees them, and the
+    only other spatial signal is attention pooled over the rigid points. No path
+    carries high spatial frequency from input to output, so a six-node delta is
+    not expressible. The lever is the architecture, not the loss.
     """
     weight = base * torch.ones_like(target_disp)
     if scheme in ("magnitude", "both"):

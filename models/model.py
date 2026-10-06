@@ -3,6 +3,8 @@ from torch_geometric.nn import GATConv, GCNConv, TAGConv, knn
 import torch
 import torch.nn.functional as F
 
+from utils.pos_encoding import to_log_freq
+
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, feature_dim, num_heads=8):
@@ -37,7 +39,7 @@ class MultiHeadAttention(nn.Module):
         return torch.cat(outputs, dim=-1)
 
 class GraphNet(nn.Module):
-    def __init__(self, input_dims, hidden_dim, output_dim, encoder_layers, decoder_layers, dropout_rate, knn_k, backbone,use_mha, num_mha_heads,mode, mha_masked=False):
+    def __init__(self, input_dims, hidden_dim, output_dim, encoder_layers, decoder_layers, dropout_rate, knn_k, backbone,use_mha, num_mha_heads,mode, mha_masked=False, skip_pos=False, skip_freqs=3):
         super(GraphNet, self).__init__()
 
         self.encoder_layers = encoder_layers
@@ -81,6 +83,24 @@ class GraphNet(nn.Module):
         self.decoder = nn.Sequential(*decoder)
         self.multihead_attention = MultiHeadAttention(hidden_dim, num_heads=num_mha_heads)
 
+        # Optional high-frequency skip; see forward() for why it is built in the
+        # contact frame. Only constructed when asked for, so checkpoints trained
+        # without it still load.
+        self.skip_pos = skip_pos
+        self.skip_freqs = skip_freqs
+        if self.skip_pos:
+            skip_in_dim = 3 * (1 + 2 * int(skip_freqs))  # to_log_freq(x, n, 1)
+            self.skip_encoder = nn.Sequential(
+                nn.Linear(skip_in_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, output_dim),
+            )
+            # Zero the output layer so the branch starts as an exact no-op: a
+            # skip_pos run then begins from the same function as the stock model
+            # and any difference is attributable to what the branch learns.
+            nn.init.zeros_(self.skip_encoder[-1].weight)
+            nn.init.zeros_(self.skip_encoder[-1].bias)
+
     def forward(self, graph_resting, graph_rigid):
         # For resting graph
         x_resting = graph_resting.x
@@ -112,6 +132,24 @@ class GraphNet(nn.Module):
         # Pass through the decoder to get the deformed positions
         x_out = self.decoder(x_combined)
 
+        if self.skip_pos:
+            # A direct path from the positional encoding to the output.
+            #
+            # The naive form of this is useless for two reasons, both fixed by
+            # putting the encoding in the contact frame:
+            #   * graph_resting.x is identical for every sample (the HRA sets
+            #     share one rest mesh), so a branch computed from it alone emits
+            #     a fixed field and can never move the bump onto the needle;
+            #   * the trunk encodes with to_log_freq(x, 3, 1), whose highest band
+            #     is 4 rad per unit -- a 1.6 mm wavelength at length_scale=1000,
+            #     coarser than the ~0.3 mm dent it has to represent. The skip
+            #     therefore gets its own, wider band budget (skip_freqs).
+            # Coordinates are relative to the tip, so the target becomes one
+            # learned shape shared by every sample instead of a bump that sits
+            # somewhere new in absolute coordinates each time.
+            rel = graph_resting.pos - self._needle_tip(graph_resting, graph_rigid)
+            x_out = x_out + self.skip_encoder(to_log_freq(rel, self.skip_freqs, 1))
+
         # Building a graph with deformed positions
         deformed_graph = graph_resting.clone()
         if  self.mode == "res":
@@ -120,3 +158,28 @@ class GraphNet(nn.Module):
             deformed_graph.pos = x_out
 
         return deformed_graph
+
+    @staticmethod
+    def _needle_tip(graph_resting, graph_rigid):
+        """Per-resting-node needle tip, in graph units.
+
+        The rigid graph is a query set built as ``unit_sphere * radius + tip``,
+        so each sample's rigid centroid is that sample's tip, up to the sphere's
+        own centroid offset -- a constant of the point set that the skip branch
+        can absorb. Unbatched graphs fall back to the global centroid.
+        """
+        batch_rigid = getattr(graph_rigid, "batch", None)
+        if batch_rigid is None:
+            return graph_rigid.pos.mean(dim=0, keepdim=True)
+
+        pos = graph_rigid.pos
+        dtype, device = pos.dtype, pos.device
+        n_graphs = int(batch_rigid.max()) + 1
+        tip = torch.zeros(n_graphs, pos.size(-1), dtype=dtype, device=device)
+        count = torch.zeros(n_graphs, dtype=dtype, device=device)
+        tip.index_add_(0, batch_rigid, pos)
+        count.index_add_(0, batch_rigid, torch.ones_like(batch_rigid, dtype=dtype))
+        tip = tip / count.clamp(min=1).unsqueeze(-1)
+
+        batch_resting = getattr(graph_resting, "batch", None)
+        return tip[:1] if batch_resting is None else tip[batch_resting]

@@ -12,7 +12,9 @@ def load_model(config):
                     num_mha_heads= config.network.num_mha_heads,
                     backbone=config.network.backbone,
                     mode=config.network.mode,
-                    mha_masked=config.network.mha_masked)
+                    mha_masked=config.network.mha_masked,
+                    skip_pos=config.network.skip_pos,
+                    skip_freqs=config.network.skip_freqs)
 
     return model
 

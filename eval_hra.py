@@ -59,6 +59,11 @@ def parse_args():
                              "first CUDA call pays for context init and cudnn "
                              "autotuning, which is not steady-state inference")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--clamp-side", default=None, choices=["above", "below", "none"],
+                        help="which side of clamp_z_m the scene holds rigid; "
+                             "'above' for hra_dataset_fundus, 'below' for "
+                             "hra_dataset_large. Default: the config's "
+                             "dataset.clamp_side.")
     parser.add_argument("--report", default=None, help="write a JSON report here")
     parser.add_argument("--per-case-csv", default=None,
                         help="write per-case metrics here")
@@ -76,7 +81,28 @@ def unpack(batch, device):
     )
 
 
-def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
+def active_mask(soft_rest, node_batch, meta_data, clamp_scale, clamp_side):
+    """Nodes the scene leaves free to move.
+
+    The clamp flipped between dataset generations and ``meta.json`` does not
+    record which way, so it comes from the config: in ``hra_dataset_large`` the
+    membrane *below* ``clamp_z_m`` is held rigid, in ``hra_dataset_fundus`` the
+    membrane *above* it is. Getting this backwards selects the frozen band --
+    which on fundus is 1722 nodes with exactly zero displacement, so the
+    "active" metrics would come out NaN rather than obviously wrong.
+    """
+    if clamp_side is None:
+        return torch.ones(soft_rest.pos.shape[0], dtype=torch.bool, device=soft_rest.pos.device)
+    z = soft_rest.pos[:, 2]
+    clamp = torch.as_tensor(meta_data["clamp_z_m"], device=z.device)[node_batch] * clamp_scale
+    if clamp_side == "above":       # rigid where z >= clamp_z, so active is below
+        return z < clamp
+    if clamp_side == "below":       # rigid where z < clamp_z, so active is above
+        return z > clamp
+    raise ValueError("clamp_side must be 'above', 'below' or None, got %r" % (clamp_side,))
+
+
+def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0, clamp_side=None):
     """Per-sample metrics plus an inference-speed profile.
 
     Returns ``(records, timing)``. Lengths are in um; times are in seconds and
@@ -127,10 +153,7 @@ def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
             edge_index = soft_def.edge_index
             # Nodes in the clamped band are held fixed by the scene and never
             # move, so they dilute every all-node average.
-            active = soft_rest.pos[:, 2] > (
-                torch.as_tensor(meta_data["clamp_z_m"], device=device)[node_batch]
-                * clamp_scale
-            )
+            active = active_mask(soft_rest, node_batch, meta_data, clamp_scale, clamp_side)
 
             gt_mag = (gt - soft_rest.pos).norm(dim=-1).cpu().numpy() * UM_PER_UNIT
             pred_mag = (pred - soft_rest.pos).norm(dim=-1).cpu().numpy() * UM_PER_UNIT
@@ -149,7 +172,7 @@ def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
                 rest = soft_rest.pos[node_mask]
                 err = pred[node_mask] - gt[node_mask]
                 target = gt[node_mask] - rest
-                active_mask = active[node_mask]
+                sample_active = active[node_mask]
 
                 edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
                 if edge_mask.sum() > 0:
@@ -180,8 +203,8 @@ def evaluate(model, loader, clamp_scale, device, limit=None, warmup=0):
                     "norm_err": (abs_err.sum() / abs_target.sum()).item(),
                     "consistency_um": consistency * UM_PER_UNIT,
                 }
-                if active_mask.any():
-                    a_err, a_gt = abs_err[active_mask], abs_target[active_mask]
+                if sample_active.any():
+                    a_err, a_gt = abs_err[sample_active], abs_target[sample_active]
                     record["active_mae_um"] = a_err.mean().item() * UM_PER_UNIT
                     record["active_zero_base_um"] = a_gt.mean().item() * UM_PER_UNIT
                     record["active_norm_err"] = (
@@ -382,6 +405,9 @@ def main():
     model.load_state_dict(torch.load(args.weights, map_location=device))
 
     clamp_scale = float(config.dataset.length_scale or 1.0)
+    clamp_side = args.clamp_side or config.dataset.clamp_side
+    if clamp_side == "none":
+        clamp_side = None
 
     splits = []
     if args.split in ("val", "all"):
@@ -392,7 +418,8 @@ def main():
     all_summaries, all_records, all_speeds, all_peaks = {}, {}, {}, {}
     for name, loader in splits:
         records, timing, peaks = evaluate(
-            model, loader, clamp_scale, device, limit=args.limit, warmup=args.warmup
+            model, loader, clamp_scale, device, limit=args.limit, warmup=args.warmup,
+            clamp_side=clamp_side,
         )
         all_records[name] = records
         all_speeds[name] = timing
@@ -417,6 +444,7 @@ def main():
                 {
                     "weights": args.weights,
                     "config": args.config,
+                    "clamp_side": clamp_side,
                     "summaries": all_summaries,
                     "speed": all_speeds,
                     # inf is not valid JSON; None marks the open-ended last bin.

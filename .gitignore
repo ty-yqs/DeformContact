@@ -26,3 +26,8 @@ __pycache__
 *.ply
 *.stl
 *.pth
+
+dataset/hra_dataset_fundus.zip
+dataset/hra_dataset_fundus/
+dataset/hra_dataset_fundus_v2/
+dataset/hra_dataset_fundus_v2.zip

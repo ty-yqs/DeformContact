@@ -88,8 +88,27 @@ class DatasetConfig:
         self.filter_status = None
         self.filter_hold_settled = None
         self.filter_min_force = None
+        # Drop cases whose *sample-frame* peak displacement is far short of the
+        # commanded press depth. The driver's own gate compares max_disp_m,
+        # which is the peak over the whole 1201-frame trajectory, so a case
+        # that grabs the displacement and then releases it before the sample
+        # frame still passes it -- those samples give one pose two different
+        # depths and are ambiguous to regress. README recommends 0.80.
+        # None disables (and avoids reading every displacement file).
+        self.filter_min_disp_ratio = None
         self.exclude_regression = None
         self.preload = None
+        # Which side of clamp_z_m the scene holds rigid. The clamp flipped
+        # between dataset generations: in hra_dataset_large the membrane BELOW
+        # clamp_z_m is frozen, in hra_dataset_fundus the membrane ABOVE it is.
+        # "above" | "below" | None (None = do not mask; use every node).
+        self.clamp_side = None
+        # Append the needle's bevel roll to the rigid-graph features. Without
+        # it ``needle_direction`` fixes the axis but not the roll about it, so
+        # the four tilt-0 azimuth cases of a site are bit-identical inputs with
+        # targets up to 67.7 um apart (31.8% of fundus cases). Adds 3 to
+        # network.input_dims[1]: 25 -> 28.
+        self.use_needle_pose = None
 
 class VisualizationConfig:
     def __init__(self):
@@ -126,6 +145,13 @@ class TrainingConfig:
         self.loss_weight_ref_um = None
         self.loss_contact_sigma_mm = None
         self.loss_weight_base = None
+        # Optional LR decay. "none" reproduces the original fixed-LR run;
+        # "cosine" anneals to learning_rate * min_lr_ratio over n_epochs. The
+        # fixed-LR runs reported best-of-epoch on a val loss that swung 4-5x
+        # between adjacent epochs, which selects a lucky epoch rather than a
+        # converged one.
+        self.lr_schedule = None
+        self.min_lr_ratio = None
 
 class NetworkConfig:
     def __init__(self):
@@ -141,3 +167,10 @@ class NetworkConfig:
         self.num_mha_heads=None
         self.mode = None
         self.mha_masked = False
+        # Direct positional-encoding -> output branch, computed relative to the
+        # needle tip. Off by default, so the everyday path is untouched; see
+        # GraphNet.forward for why it needs the contact frame and its own
+        # frequency budget. skip_freqs follows to_log_freq's band count, whose
+        # top band is 2**(skip_freqs-1) rad per graph unit.
+        self.skip_pos = False
+        self.skip_freqs = 3

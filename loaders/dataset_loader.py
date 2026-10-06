@@ -42,7 +42,9 @@ def build_dataset(config, split):
             filter_status=config.dataset.filter_status,
             filter_hold_settled=config.dataset.filter_hold_settled,
             filter_min_force=config.dataset.filter_min_force,
+            filter_min_disp_ratio=config.dataset.filter_min_disp_ratio,
             exclude_regression=config.dataset.exclude_regression,
+            use_needle_pose=config.dataset.use_needle_pose,
             preload=config.dataset.preload,
             cache_dir=config.dataset.cache_dir,
         )
